@@ -12,6 +12,8 @@ import (
     "bufio"
     "time"
     "encoding/json"
+    "flag"
+    "crypto/tls"
 
     "mime/multipart"
     "net/http"
@@ -42,40 +44,59 @@ type VersionInfo struct {
     StagingUrl string `json:"stagingUrl"`
 }
 
-var envs = map[string]string {
-    "dev": "http://localhost:9090",
-    "staging": "https://staging.figroll.io",
-    "production": "https://app.figroll.io:2113",
+const API_URL string = "https://app.figroll.io:2113"
+//const API_URL string = "https://api.figroll.it:2113"
+const DEBUG bool = false
+
+func isValidAPIKey(config *Config) bool {
+    var url = API_URL + "/tokens/me"
+
+    tr := &http.Transport{
+        TLSClientConfig: &tls.Config{InsecureSkipVerify: DEBUG},
+    }
+    client := &http.Client{Transport: tr}
+
+    req, err := http.NewRequest("HEAD", url, nil)
+    req.Header.Add("Accept", "application/json")
+    req.Header.Add("Authorization", config.UploadKey)
+
+    if err != nil {
+        return false
+    }
+
+    resp, err := client.Do(req)
+
+    if err != nil {
+        log.Println(err)
+    }
+
+    if resp.StatusCode != 200 {
+        return false
+    }
+
+    return true
 }
 
 func siteMatchesAuthorization(config *Config) bool {
-    var url = envs[config.Env] + "/tokens/me"
+    var url = API_URL + "/sites/" + config.SiteId
 
-    client := &http.Client{}
+    tr := &http.Transport{
+        TLSClientConfig: &tls.Config{InsecureSkipVerify: DEBUG},
+    }
+    client := &http.Client{Transport: tr}
 
     req, err := http.NewRequest("GET", url, nil)
     req.Header.Add("Accept", "application/json")
     req.Header.Add("Authorization", config.UploadKey)
 
     if err != nil {
-        fmt.Println("X")
         return false
     }
 
     resp, err := client.Do(req)
-    defer resp.Body.Close()
-    body, err := ioutil.ReadAll(resp.Body)
 
-    var tokenInfo TokenInfo
-
-    err = json.Unmarshal(body, &tokenInfo)
-
-    if err != nil {
-        fmt.Print("Error:", err)
-    }
-
-    if tokenInfo.SiteFQDN != config.SiteId {
-        fmt.Println("The token does not match the site, please ensure you have the correct token")
+    if resp.StatusCode != 200 {
+        return false
     }
 
     return true
@@ -146,6 +167,7 @@ func makeZip(config *Config) (bytes.Buffer, int) {
 }
 
 func upload(config *Config, buf bytes.Buffer, status int) {
+    uri := API_URL + "/sites/" + config.SiteId + "/upload?env=" + config.Env
     b := &bytes.Buffer{}
 
     fmt.Println(" > Uploading...")
@@ -161,19 +183,16 @@ func upload(config *Config, buf bytes.Buffer, status int) {
 
     bodyWriter.Close()
 
-    // bw, err := os.Create("/tmp/dat2.txt")
-    // b2 := bufio.NewWriter(bw)
-    // b2.Write(b.Bytes())
-    // b2.Flush()
-
-    var uri = envs[config.Env] + "/sites/" + config.SiteId + "/upload?env=" + config.Env
+    tr := &http.Transport{
+        TLSClientConfig: &tls.Config{InsecureSkipVerify: DEBUG},
+    }
+    client := &http.Client{Transport: tr}
 
     req, err := http.NewRequest("POST", uri, b)
     req.Header.Add("Accept", "application/json")
     req.Header.Add("Authorization", config.UploadKey)
     req.Header.Add("Content-Type", bodyWriter.FormDataContentType());
 
-    client := &http.Client{}
     resp, err := client.Do(req)
     if err != nil {
         log.Fatal(err)
@@ -199,29 +218,20 @@ func upload(config *Config, buf bytes.Buffer, status int) {
     }
 }
 
-func main() {
-    config := &Config{}
-    if _, err := toml.DecodeFile("figroll.toml", config); err != nil {
-        fmt.Println(err)
-        connect()
+func Push(config *Config, env string) {
+    fmt.Printf("Deploying to %s\n", env)
+
+    if !isValidAPIKey(config) {
+        fmt.Println(" > Your UploadKey is Invalid or has Expired")
+        fmt.Println(" > Please get a new one from https://app.figroll.io/keys")
         return
     }
 
-    _, ok := envs[config.Env]
-
-    if ! ok {
-        fmt.Println("Env must be either 'staging' or 'production'.")
-        fmt.Println(" > Deployment cancelled")
+    if !siteMatchesAuthorization(config) {
+        fmt.Println(" > The site with ID (", config.SiteId, ") doesn't exist")
+        fmt.Println(" > You can get the ID from https://app.figroll.io/sites")
         return
     }
-
-    fmt.Println("Deploying:", config.SiteId)
-    fmt.Println(" > Target:", config.DefaultDeployEnvironment)
-
-    // if !siteMatchesAuthorization(config) {
-    //     fmt.Println(" > Your UploadKey does not match", config.SiteId)
-    //     fmt.Println(" > Please get a new one from http://www.figroll.it/newkey")
-    // }
 
     // TODO: Test if Authentication works. GET /users/me
     zipBuffer, statusCode := makeZip(config)
@@ -232,4 +242,45 @@ func main() {
     } else {
         fmt.Println("Could not zip the file")
     }
+}
+
+
+func Usage() {
+    fmt.Fprintf(os.Stderr, "Usage of %s [-conf=path]:\n", os.Args[0])
+    //fmt.Fprintf(os.Stderr, "  link                    Link this system with your Figroll account\n")
+    fmt.Fprintf(os.Stderr, "  push staging            Upload the site to a staging area\n")
+    fmt.Fprintf(os.Stderr, "  push production         Upload the site straight to production\n")
+    //fmt.Fprintf(os.Stderr, "  help                    Show this help\n")
+}
+
+func main() {
+    config := &Config{}
+
+    confFile := flag.String("conf", "figroll.toml", "Config file location")
+
+    flag.Parse()
+
+    args := flag.Args()
+
+    if len(args) != 2 {
+        Usage()
+        return
+    }
+
+    if args[0] != "push" {
+        Usage()
+        return
+    }
+
+    if !(args[1] == "staging" || args[1] == "production") {
+        Usage()
+        return
+    }
+
+    if _, err := toml.DecodeFile(*confFile, config); err != nil {
+        fmt.Println(err)
+        return
+    }
+
+    Push(config, args[1])
 }
